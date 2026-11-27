@@ -136,6 +136,20 @@
           <p id="pInsigniaRonda" class="text-xs font-extrabold uppercase tracking-wider text-white/90">Ronda 1 de 5</p>
         </div>
 
+        <div id="pTarjetaCicloCompletado" style="display:none;" class="rounded-3xl bg-white border-2 border-emerald-300 p-5 shadow-md space-y-3 text-center">
+          <span class="inline-block px-3 py-1 rounded-full bg-emerald-100 text-emerald-900 text-[11px] font-black uppercase tracking-wider">Rotación Completa • 5 de 5 Bases</span>
+          <h2 class="text-2xl font-black text-slate-900 tracking-tight">¡Gracias por participar!</h2>
+          <p class="text-sm font-semibold text-slate-700 leading-relaxed">
+            Has completado el recorrido por todas las bases del taller.
+          </p>
+          <div class="rounded-2xl bg-amber-50 border-2 border-amber-300 p-4 text-left space-y-1">
+            <p class="text-[11px] font-black uppercase tracking-wider text-amber-900">Asistencia con Consejeros</p>
+            <p id="pMensajeAsistenciaConsejeros" class="text-xs sm:text-sm font-bold text-slate-900 leading-snug">
+              Por favor acércate o reporta tu asistencia con los consejeros asignados para registrar el cierre de tu grupo.
+            </p>
+          </div>
+        </div>
+
         <div id="pTarjetaCronometro" class="rounded-3xl bg-blue-950 text-white p-4 sm:p-5 shadow-lg border-2 border-blue-800 space-y-3 transition-all">
           <div class="flex items-center justify-between gap-2">
             <span id="pBadgeFaseCronometro" class="px-3 py-1 rounded-full bg-white/15 text-white text-[11px] font-black uppercase tracking-wider">ESPERANDO AL ANFITRIÓN</span>
@@ -474,11 +488,17 @@
       getFirestore, doc, getDoc, setDoc, updateDoc, deleteDoc,
       onSnapshot, collection, getDocs, runTransaction, serverTimestamp
     } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+    import {
+      getDatabase, ref as rtdbRef, set as rtdbSet, update as rtdbUpdate,
+      onValue as rtdbOnValue, runTransaction as rtdbRunTransaction,
+      serverTimestamp as rtdbServerTimestamp
+    } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 
     const firebaseConfig = {
       apiKey: "AIzaSyBVaMuekbFqao6bff9eby0fCKRFHQOxvbQ",
       authDomain: "talleres-confejas.firebaseapp.com",
       projectId: "talleres-confejas",
+      databaseURL: "https://talleres-confejas-default-rtdb.firebaseio.com",
       storageBucket: "talleres-confejas.firebasestorage.app",
       messagingSenderId: "67200741463",
       appId: "1:67200741463:web:3b7fe9b7d0d5df3b8c7312",
@@ -758,7 +778,44 @@
       } catch (e) {}
     }
 
-    let db = null, auth = null, currentUser = null;
+    let db = null, rtdb = null, auth = null, currentUser = null;
+
+    function rtdbLiveRef() {
+      return rtdbRef(rtdb, `rooms/${sessionId}/live`);
+    }
+
+    function mergeLiveIntoSession(liveVal) {
+      if (!liveVal || typeof liveVal !== "object") return;
+      const prev = sessionData || initialSessionDoc(currentUser?.uid || "host");
+      const next = {
+        ...prev,
+        round: Number(liveVal.round ?? prev.round ?? 1),
+        cycleCompleted: Boolean(liveVal.cycleCompleted ?? prev.cycleCompleted ?? false),
+        resetEpoch: Number(liveVal.resetEpoch ?? prev.resetEpoch ?? 1),
+        alertNonce: Number(liveVal.alertNonce ?? prev.alertNonce ?? 0),
+        timerState: liveVal.timerState || prev.timerState || "WORKSHOP_IDLE",
+        remainingSec: Number(liveVal.remainingSec ?? prev.remainingSec ?? SEGUNDOS_TALLER),
+        endTime: liveVal.endTime !== undefined ? liveVal.endTime : (prev.endTime ?? null),
+        timerCycle: Number(liveVal.timerCycle ?? prev.timerCycle ?? 1),
+        workshops: Array.isArray(liveVal.workshops) && liveVal.workshops.length === 5
+          ? liveVal.workshops
+          : (prev.workshops || TALLERES_PREDETERMINADOS)
+      };
+      if (typeof liveVal.updatedAtMs === "number" && liveVal.updatedAtMs > 0) {
+        serverOffsetMs = liveVal.updatedAtMs - Date.now();
+      }
+      handleSessionUpdate(next);
+    }
+
+    async function publishLiveState(patch) {
+      if (!rtdb) return;
+      const nowMs = Date.now();
+      await rtdbUpdate(rtdbLiveRef(), {
+        ...patch,
+        updatedAtMs: nowMs,
+        rtdbServerAt: rtdbServerTimestamp()
+      });
+    }
     let sessionData = null, participants = [], myRecord = null;
     let filterTeam = "todos", searchText = "";
     let shownAlertNonce = null, rangCycle = null;
@@ -775,6 +832,7 @@
         teamCounts: { "1": 0, "2": 0, "3": 0, "4": 0, "5": 0 },
         totalParticipants: 0,
         round: 1,
+        cycleCompleted: false,
         resetEpoch: 1,
         alertNonce: 0,
         timerState: "WORKSHOP_IDLE",
@@ -798,6 +856,9 @@
 
     function computeTimer(s) {
       if (!s) return { effectiveState: "WORKSHOP_IDLE", secondsLeft: SEGUNDOS_TALLER };
+      if (s.cycleCompleted || s.timerState === "CYCLE_COMPLETED") {
+        return { effectiveState: "CYCLE_COMPLETED", secondsLeft: 0 };
+      }
       const baseState = s.timerState || "WORKSHOP_IDLE";
       const savedSec = Number(s.remainingSec ?? SEGUNDOS_TALLER);
       const endMs = s.endTime ? Number(s.endTime) : null;
@@ -858,6 +919,12 @@
           setText("pMensajeEstadoCronometro", "Tiempo de desplazamiento al siguiente taller");
           setText("pEtiquetaDuracionBloque", "Desplazamiento");
           setText("pSubDetalleReloj", "de 10 minutos");
+        } else if (t.effectiveState === "CYCLE_COMPLETED") {
+          setText("pBadgeFaseCronometro", "CICLO COMPLETADO");
+          setHtml("pEstadoPulsante", `<span class="w-2 h-2 rounded-full bg-emerald-300"></span> Finalizado`);
+          setText("pMensajeEstadoCronometro", "¡Gracias por participar! Reporta tu asistencia con los consejeros.");
+          setText("pEtiquetaDuracionBloque", "Completado");
+          setText("pSubDetalleReloj", "Todas las bases");
         } else {
           setText("pBadgeFaseCronometro", "DESPLAZAMIENTO FINALIZADO");
           setHtml("pEstadoPulsante", `<span class="w-2 h-2 rounded-full bg-white"></span> En espera`);
@@ -899,6 +966,12 @@
         setText("hMensajeGuiaCronometro", "Desplazamiento en curso (10:00). Puedes iniciar el siguiente taller cuando todos estén listos.");
         if (mainBtn) { mainBtn.textContent = "Iniciar Siguiente Taller Ahora"; mainBtn.className = "w-full py-4 px-5 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-sm sm:text-base"; }
         if (pauseBtn) { pauseBtn.disabled = false; pauseBtn.classList.remove("opacity-40"); pauseBtn.textContent = "⏸ Pausar"; }
+      } else if (t.effectiveState === "CYCLE_COMPLETED") {
+        if (badge) { badge.textContent = "Ciclo Completado • Asistencia con Consejeros"; badge.className = "px-3 py-1 rounded-full bg-emerald-500 text-slate-950 text-xs font-extrabold uppercase"; }
+        setText("hSubEstadoReloj", "Todas las bases completadas • Gracias por participar");
+        setText("hMensajeGuiaCronometro", "Se completaron las 5 bases. Los participantes ven el mensaje de agradecimiento y la indicación de asistencia con los consejeros.");
+        if (mainBtn) { mainBtn.textContent = "Iniciar Nuevo Ciclo (Ronda 1 • 35:00)"; mainBtn.className = "w-full py-4 px-5 rounded-2xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-black text-sm sm:text-base"; }
+        if (pauseBtn) { pauseBtn.disabled = true; pauseBtn.classList.add("opacity-40"); pauseBtn.textContent = "⏸ Pausar"; }
       } else {
         if (badge) { badge.textContent = "Fase: Desplazamiento Finalizado (00:00)"; badge.className = "px-3 py-1 rounded-full bg-indigo-500 text-white text-xs font-extrabold uppercase"; }
         setText("hSubEstadoReloj", "Desplazamiento finalizado • Esperando al anfitrión");
@@ -1015,9 +1088,22 @@
       const currentWs = getWorkshopForTeam(teamNum, round, workshops);
       const nextWs = getWorkshopForTeam(teamNum, nextRound, workshops);
 
+      const isCompleted = Boolean(sessionData.cycleCompleted || sessionData.timerState === "CYCLE_COMPLETED");
       setText("pNombreMostrado", myRecord.name);
-      setText("pInsigniaRonda", `Ronda ${round} de 5`);
+      setText("pInsigniaRonda", isCompleted ? "Ciclo Completado (5 de 5 Bases)" : `Ronda ${round} de 5`);
       setText("pBadgeHeroeEquipo", `EQUIPO ${teamNum}`);
+
+      if (isCompleted) {
+        showEl("pTarjetaCicloCompletado", "block");
+        hideEl("pTarjetaTallerActual");
+        setText(
+          "pMensajeAsistenciaConsejeros",
+          `¡Gracias por participar en todas las bases, ${myRecord.name}! Por favor reporta tu asistencia con los consejeros del Equipo ${teamNum}.`
+        );
+      } else {
+        hideEl("pTarjetaCicloCompletado");
+        showEl("pTarjetaTallerActual", "block");
+      }
 
       setText("pNumeroTallerBadge", `Base ${currentWs.numero}`);
       setText("pTallerNombreGrande", currentWs.titulo);
@@ -1194,6 +1280,14 @@
       }
 
       try {
+        rtdbOnValue(rtdbLiveRef(), (snap) => {
+          if (snap.exists()) mergeLiveIntoSession(snap.val());
+        });
+      } catch (err) {
+        console.warn("rtdb live listener fallback:", err);
+      }
+
+      try {
         onSnapshot(sRef, (dSnap) => {
           if (dSnap.exists()) handleSessionUpdate(dSnap.data());
         });
@@ -1347,6 +1441,17 @@
             : Date.now();
           const patch = updater(curr, baseMs);
           tx.update(sessionRef(), { ...patch, serverSyncAt: serverTimestamp() });
+          publishLiveState({
+            round: patch.round ?? curr.round ?? 1,
+            cycleCompleted: patch.cycleCompleted !== undefined ? Boolean(patch.cycleCompleted) : Boolean(curr.cycleCompleted ?? false),
+            resetEpoch: patch.resetEpoch ?? curr.resetEpoch ?? 1,
+            alertNonce: patch.alertNonce ?? curr.alertNonce ?? 0,
+            timerState: patch.timerState ?? curr.timerState ?? "WORKSHOP_IDLE",
+            remainingSec: patch.remainingSec ?? curr.remainingSec ?? SEGUNDOS_TALLER,
+            endTime: patch.endTime !== undefined ? patch.endTime : (curr.endTime ?? null),
+            timerCycle: patch.timerCycle ?? curr.timerCycle ?? 1,
+            workshops: patch.workshops ?? curr.workshops ?? TALLERES_PREDETERMINADOS
+          }).catch(() => {});
         });
       } catch (err) {
         console.error(err);
@@ -1395,6 +1500,8 @@
       async function startWorkshop35() {
         initAudio();
         await mutateSessionAtomic((curr, baseMs) => ({
+          round: curr.cycleCompleted ? 1 : Number(curr.round || 1),
+          cycleCompleted: false,
           timerState: "WORKSHOP_RUNNING",
           remainingSec: SEGUNDOS_TALLER,
           endTime: baseMs + SEGUNDOS_TALLER * 1000,
@@ -1405,12 +1512,26 @@
 
       async function startTransition10() {
         initAudio();
+        let completedCycle = false;
         let nextR = 1;
         await mutateSessionAtomic((curr, baseMs) => {
           const rNow = Number(curr.round || 1);
-          nextR = rNow >= 5 ? 1 : rNow + 1;
+          if (rNow >= 5) {
+            completedCycle = true;
+            return {
+              round: 5,
+              cycleCompleted: true,
+              alertNonce: baseMs,
+              timerState: "CYCLE_COMPLETED",
+              remainingSec: 0,
+              endTime: null,
+              timerCycle: Number(curr.timerCycle || 1) + 1
+            };
+          }
+          nextR = rNow + 1;
           return {
             round: nextR,
+            cycleCompleted: false,
             alertNonce: baseMs,
             timerState: "TRANSITION_RUNNING",
             remainingSec: SEGUNDOS_DESPLAZAMIENTO,
@@ -1418,7 +1539,11 @@
             timerCycle: Number(curr.timerCycle || 1) + 1
           };
         });
-        showToast(`10:00 de desplazamiento iniciados • Ronda ${nextR}`);
+        if (completedCycle) {
+          showToast("Ciclo de 5 bases finalizado • Agradecimiento y asistencia con consejeros");
+        } else {
+          showToast(`10:00 de desplazamiento iniciados • Ronda ${nextR}`);
+        }
       }
 
       onClick("hBtnAccionPrincipalCronometro", startWorkshop35);
@@ -1554,6 +1679,7 @@
             teamCounts: { "1": 0, "2": 0, "3": 0, "4": 0, "5": 0 },
             totalParticipants: 0,
             round: 1,
+            cycleCompleted: false,
             resetEpoch: Number(sessionData?.resetEpoch || 1) + 1,
             alertNonce: 0,
             timerState: "WORKSHOP_IDLE",
@@ -1588,7 +1714,28 @@
 
       const sRef = sessionRef();
       const snap = await getDoc(sRef);
-      if (!snap.exists()) await setDoc(sRef, initialSessionDoc(currentUser.uid));
+      const baseDoc = snap.exists() ? snap.data() : initialSessionDoc(currentUser.uid);
+      if (!snap.exists()) await setDoc(sRef, baseDoc);
+
+      try {
+        await rtdbSet(rtdbLiveRef(), {
+          round: Number(baseDoc.round || 1),
+          resetEpoch: Number(baseDoc.resetEpoch || 1),
+          alertNonce: Number(baseDoc.alertNonce || 0),
+          timerState: baseDoc.timerState || "WORKSHOP_IDLE",
+          remainingSec: Number(baseDoc.remainingSec ?? SEGUNDOS_TALLER),
+          endTime: baseDoc.endTime ?? null,
+          timerCycle: Number(baseDoc.timerCycle || 1),
+          workshops: baseDoc.workshops || TALLERES_PREDETERMINADOS,
+          updatedAtMs: Date.now(),
+          rtdbServerAt: rtdbServerTimestamp()
+        });
+        rtdbOnValue(rtdbLiveRef(), (rSnap) => {
+          if (rSnap.exists()) mergeLiveIntoSession(rSnap.val());
+        });
+      } catch (err) {
+        console.warn("rtdb host init fallback:", err);
+      }
 
       onSnapshot(sRef, (dSnap) => {
         if (dSnap.exists()) handleSessionUpdate(dSnap.data());
@@ -1617,6 +1764,11 @@
         const app = initializeApp(firebaseConfig);
         auth = getAuth(app);
         db = getFirestore(app);
+        try {
+          rtdb = getDatabase(app);
+        } catch (rtdbErr) {
+          console.warn("Realtime Database not initialized:", rtdbErr);
+        }
         const cred = await signInAnonymously(auth);
         currentUser = cred.user;
 
